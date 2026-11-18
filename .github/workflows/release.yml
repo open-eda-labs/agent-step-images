@@ -1,0 +1,29 @@
+name: release
+
+# Tag v* (feita por humano) publica a imagem no GHCR da org; o agent-workflows fixa o digest impresso no resumo.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # Pendência: pinar por SHA de commit (D-40).
+      - uses: actions/checkout@v4.2.2
+        with:
+          persist-credentials: false
+      - name: build e push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          IMAGE="ghcr.io/open-eda-labs/agent-step-images:${GITHUB_REF_NAME#v}"
+          echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build --tag "$IMAGE" .
+          docker push "$IMAGE"
+          echo "Publicada: \`$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE")\`" >> "$GITHUB_STEP_SUMMARY"
