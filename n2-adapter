@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Adaptador do passo N2 (P5): roda o harness (Cline CLI) sobre o repositório que quebrou e devolve patch.diff só com `mvn verify` verde.
+
+Uso: n2-adapter <in> <out>   (é o N2_HOOK do passo fix de agent-workflows; contrato na docstring de steps/fix/fix.py)
+Entrada: <in>/repo (cópia do repositório que quebrou, já com as versões novas) e <in>/error.log (log do Maven).
+Saída: <out>/patch.diff (diff sobre <in>/repo, aplicável com `git apply` na raiz do repositório). Nada mais é escrito em <out>.
+Ambiente: OPENAI_BASE_URL, MODEL (nome lógico no gateway, D-09) e OPENAI_API_KEY (chave do gateway), obrigatórios;
+N2_TIMEOUT (segundos do harness, padrão 1800), N2_MAX_STEPS (iterações do agente, padrão 30), N2_HARNESS (binário, padrão `cline`).
+Códigos de saída: 0 patch gravado; 2 uso ou ambiente; 3 harness falhou, estourou o tempo ou o limite de passos; 4 `mvn verify` vermelho;
+5 diff vazio; 6 diff recusado (caminho proibido, versão em pom.xml, teste desligado ou apagado). Qualquer código diferente de zero = N2 não resolveu.
+Trocar de harness = trocar a imagem e as funções `harness_*` deste arquivo; o resto (cópia, prompt, verify, recusa, diff) é do contrato.
+"""
+
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+
+HERE = pathlib.Path(__file__).resolve().parent
+PROMPT = HERE / "prompts" / "n2-migration.v1.md"  # o nome (sem .md) é o N2_PROMPT do publish; mudou o texto, sobe a versão
+AGENTS = HERE / "workspace" / "AGENTS.md"
+LOG_TAIL = 12000  # caracteres finais do error.log que vão no prompt (o começo do log do Maven é download e plugin)
+VERIFY = ["mvn", "-B", "-ntp", "-q", "verify"]
+VERIFY_TIMEOUT = 1200  # N2_TIMEOUT + VERIFY_TIMEOUT fica abaixo do HOOK_TIMEOUT (3600 s) do fix
+# Mesma regra do check_patches do publish (agent-workflows steps/publish/publish.py, FORBIDDEN): CI, imagem e scripts o agente não mexe.
+FORBIDDEN = re.compile(r"\.github/|(.*/)?Dockerfile$|.*\.sh$")
+VERSION_LINE = re.compile(r"<[\w.-]*version>")  # versão em pom.xml é do N1 e do parent (ADR-0005); o N2 só migra código
+TEST_OFF = re.compile(r"@(Disabled|Ignore)\b|skipTests|maven\.test\.skip|testFailureIgnore")
+SECRET_ENV = re.compile(r"TOKEN|SECRET|PASSWORD|KEY|CREDENTIAL", re.I)  # nada disso chega ao processo do agente (D-42: D3 nunca vai a modelo)
+
+
+class Fail(Exception):
+    def __init__(self, code, msg):
+        super().__init__(msg)
+        self.code = code
+
+
+def log(msg):
+    print(f"n2: {msg}", file=sys.stderr, flush=True)
+
+
+def git(work, *args, **kw):
+    return subprocess.run(["git", "-c", "user.name=n2", "-c", "user.email=n2@localhost", *args], cwd=work, check=True, capture_output=True, text=True, **kw).stdout
+
+
+def agent_env():
+    """Ambiente do harness e do verify: sem segredo e com o Maven offline (o fix já baixou tudo para ~/.m2; o token do GitHub Packages fica fora)."""
+    env = {k: v for k, v in os.environ.items() if not SECRET_ENV.search(k)}
+    env["MAVEN_ARGS"] = (os.environ.get("MAVEN_ARGS", "") + " -o").strip()
+    env.update(DISABLE_TELEMETRY="1", DO_NOT_TRACK="1")
+    return env
+
+
+def prepare(src, scratch):
+    """Cópia de trabalho sem .git nem target, com um commit de base: o diff final é só o que o agente mudou."""
+    work = scratch / "repo"
+    shutil.copytree(src, work, ignore=shutil.ignore_patterns(".git", "target"))
+    git(work, "init", "-q")
+    (work / ".git" / "info" / "exclude").write_text("target/\nAGENTS.md\n.cline/\n")
+    git(work, "add", "-A")
+    git(work, "commit", "-q", "--allow-empty", "-m", "base")
+    if not (work / "AGENTS.md").exists():  # shortcut: AGENTS.md do próprio repositório ganha do nosso; juntar os dois quando um repositório alvo tiver um
+        shutil.copy(AGENTS, work / "AGENTS.md")
+    return work
+
+
+def prompt(error_log):
+    return PROMPT.read_text().replace("{error_log}", error_log[-LOG_TAIL:])
+
+
+def harness_setup(scratch, env):
+    """Cline: grava provedor OpenAI-compatível, modelo e chave num diretório de config descartável (fora da cópia de trabalho)."""
+    cfg = scratch / "cline"
+    # shortcut: a chave do gateway fica em arquivo no /tmp do pod enquanto o harness roda e o agente pode lê-la; isolar o agente em outro pod quando houver
+    r = subprocess.run([os.environ.get("N2_HARNESS", "cline"), "auth", "-p", "openai-compatible", "-k", os.environ["OPENAI_API_KEY"],
+                        "-m", os.environ["MODEL"], "-b", os.environ["OPENAI_BASE_URL"], "--config", str(cfg)],
+                       env=env, capture_output=True, text=True, timeout=60)
+    if r.returncode:
+        raise Fail(3, f"auth do harness falhou: {r.stderr.strip()[-300:]}")
+    return cfg
+
+
+def harness_run(cfg, work, task, env, timeout, max_steps):
+    """Cline headless (`-y --json`). O limite de passos conta `iteration_start` no stream JSON: o Cline 3.0.74 não tem flag para isso."""
+    p = subprocess.Popen([os.environ.get("N2_HARNESS", "cline"), "-y", "--json", "-t", str(timeout), "--config", str(cfg), "-c", str(work), task],
+                         env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    steps, why, usage = 0, None, {}
+    expired = threading.Event()
+    timer = threading.Timer(timeout, lambda: (expired.set(), p.kill()))  # o `-t` do Cline não para um laço sem ferramenta; o relógio daqui para
+    timer.start()
+    try:
+        for line in p.stdout:
+            ev = json.loads(line).get("event", {}) if line.startswith("{") else {}
+            if ev.get("type") == "iteration_start":
+                steps += 1
+                if steps > max_steps:
+                    why = f"limite de {max_steps} passos"
+                    p.kill()
+            elif ev.get("type") == "usage":
+                usage = ev
+            elif ev.get("type") == "content_start" and ev.get("contentType") == "tool":
+                log(f"passo {steps}: {ev.get('toolName')}")
+        p.wait()
+    finally:
+        timer.cancel()
+    log(f"harness terminou em {steps} passos (código {p.returncode}); tokens: {usage.get('totalInputTokens')} entrada, {usage.get('totalOutputTokens')} saída")
+    if why or expired.is_set():
+        raise Fail(3, why or f"tempo limite de {timeout} s")
+    # O código de saída do Cline não decide nada (sai 0 até quando desiste): quem decide é o verify abaixo.
+
+
+def check(diff):
+    """Recusa (código 6) o que o agente não pode mudar. Mesmas regras do publish, mais versão em qualquer pom.xml e teste desligado."""
+    path = None
+    for line in diff.splitlines():
+        if m := re.match(r"diff --git a/(\S+) b/(\S+)", line):
+            if any(FORBIDDEN.match(f) for f in m.groups()):
+                raise Fail(6, f"diff toca {m[2]}")
+            path = m[2]
+        elif line.startswith("deleted file") and "src/test/" in path:
+            raise Fail(6, f"diff apaga teste {path}")
+        elif line[:1] in "+-" and not line.startswith(("+++", "---")):
+            if path.endswith("pom.xml") and VERSION_LINE.search(line):
+                raise Fail(6, f"diff muda versão em {path}: {line.strip()}")
+            if line[0] == "+" and TEST_OFF.search(line):
+                raise Fail(6, f"diff desliga teste em {path}: {line[1:].strip()}")
+
+
+def run(in_dir, out_dir):
+    for v in ("OPENAI_BASE_URL", "MODEL", "OPENAI_API_KEY"):
+        if not os.environ.get(v):
+            raise Fail(2, f"{v} ausente")
+    if not (in_dir / "repo").is_dir() or not (in_dir / "error.log").is_file() or not out_dir.is_dir():
+        raise Fail(2, "esperado <in>/repo, <in>/error.log e <out> existente")
+    env = agent_env()
+    with tempfile.TemporaryDirectory(prefix="n2-") as s:
+        scratch = pathlib.Path(s)
+        work = prepare(in_dir / "repo", scratch)
+        cfg = harness_setup(scratch, env)
+        harness_run(cfg, work, prompt((in_dir / "error.log").read_text(errors="replace")), env,
+                    int(os.environ.get("N2_TIMEOUT", "1800")), int(os.environ.get("N2_MAX_STEPS", "30")))
+        git(work, "add", "-A")
+        diff = git(work, "diff", "--cached", "--binary")
+        if not diff.strip():
+            raise Fail(5, "o agente não mudou nada")
+        check(diff)
+        shutil.rmtree(work / "target", ignore_errors=True)  # verify limpo: nada do que o agente compilou conta
+        try:
+            v = subprocess.run(VERIFY, cwd=work, env=env, capture_output=True, text=True, timeout=VERIFY_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise Fail(4, "mvn verify estourou o tempo")
+        if v.returncode:
+            raise Fail(4, "mvn verify vermelho: " + " | ".join(l for l in v.stdout.splitlines() if "[ERROR]" in l)[:300])
+        (out_dir / "patch.diff").write_text(diff)
+        log(f"patch.diff gravado ({len(diff.splitlines())} linhas)")
+
+
+def main(argv):
+    if len(argv) != 3:
+        print(__doc__, file=sys.stderr)
+        return 2
+    try:
+        run(pathlib.Path(argv[1]), pathlib.Path(argv[2]))
+    except Fail as e:
+        log(str(e))
+        return e.code
+    except subprocess.TimeoutExpired:
+        log("harness não respondeu no auth")
+        return 3
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
